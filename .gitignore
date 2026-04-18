@@ -1,0 +1,57 @@
+# ─── colcon build artefacts ───────────────────────────────────────────
+build/
+install/
+log/
+
+# Per-package build detritus
+src/*/build/
+src/*/install/
+src/*/log/
+src/*/.eggs/
+src/*/*.egg-info/
+
+# ─── Python bytecode / packaging ───────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.so
+.Python
+.pytest_cache/
+.coverage
+.tox/
+.mypy_cache/
+.ruff_cache/
+
+# ─── Virtualenvs ───────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ─── IDE / editor ──────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+
+# ─── Local agent / caches (do NOT commit transient state) ──────────────
+.remember/
+.cursor/
+.claude/plugins/
+
+# ─── Local secrets / env ───────────────────────────────────────────────
+.env
+*.env.local
+secrets.yaml
+
+# ─── ROS2 conventional ignores ─────────────────────────────────────────
+*.rviz.bak
+*.bag
+*.db3
+*.mcap
+
+# ─── Generated package files we DO check in ────────────────────────────
+# (explicitly whitelisted below even though the rules above would skip them)
+!src/**/package.xml
+!src/**/setup.py
+!src/**/setup.cfg
+!src/**/pyproject.toml

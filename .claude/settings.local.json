@@ -1,0 +1,27 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//home/fh1m/Envs/dockers/auv-ros2/Ros_workspaces/**)",
+      "Read(//home/fh1m/Envs/dockers/auv-ros2/stuff/**)",
+      "Bash(pip3 list *)",
+      "Bash(apt list *)",
+      "Bash(python3 -c \"import pymavlink; print\\('pymavlink ok'\\)\")",
+      "Bash(python3 -c \"from pymavlink import mavutil; print\\('mavutil ok'\\)\")",
+      "WebFetch(domain:www.ardusub.com)",
+      "WebFetch(domain:mavlink.io)",
+      "WebFetch(domain:www.darksleep.com)",
+      "WebFetch(domain:ardupilot.org)",
+      "WebFetch(domain:medium.com)",
+      "WebFetch(domain:design.ros2.org)",
+      "Bash(bash -c 'source /opt/ros/humble/setup.bash 2>/dev/null; \\\\ *)",
+      "Bash(cp -r /home/fh1m/Ros_workspaces/duburi_ws/src/duburi_control /home/fh1m/Envs/dockers/auv-ros2/Ros_workspaces/duburi_ws/src/)",
+      "Bash(cp -r /home/fh1m/Ros_workspaces/duburi_ws/src/duburi_manager /home/fh1m/Envs/dockers/auv-ros2/Ros_workspaces/duburi_ws/src/)",
+      "Bash(python3 *)",
+      "Bash(chmod +x *)",
+      "Bash(pip install *)",
+      "Bash(bash -c ' *)",
+      "Bash(bash build_duburi.sh)",
+      "Bash(bash *)"
+    ]
+  }
+}

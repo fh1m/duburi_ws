@@ -1,0 +1,18 @@
+# Goal — one field per command type, unused fields are zero/empty
+string  cmd          # arm | disarm | set_mode | stop | move_forward | move_back | move_left | move_right | set_depth | yaw_left | yaw_right
+float32 duration     # seconds  (move_*)
+float32 gain         # 0-100 %  (move_*)
+float32 target       # metres   (set_depth, negative) or degrees (yaw_*)
+string  target_name  # mode string  (set_mode)
+float32 timeout      # max wait (all commands)
+---
+# Result
+bool    success
+string  message
+float32 final_value  # depth reached or heading locked
+---
+# Feedback
+string  phase        # e.g. "EXECUTING", "DONE"
+float32 current_value
+float32 error_value
+string  status_line  # human-readable one-liner

@@ -1,0 +1,16 @@
+# Default parameters for the duburi_manager node.
+#
+# Network topology (see connection_config.py for full diagram):
+#   Pixhawk → Raspberry Pi (BlueOS)  192.168.2.1  / GW 192.168.2.2
+#                    │  switch
+#                    ▼
+#              Jetson Orin Nano      192.168.2.69  (static)
+#              ros2 listens on udpin:0.0.0.0:14550
+#
+# BlueOS endpoint:  name=inspector  type=UDP Client  target=192.168.2.69:14550
+
+duburi_manager:
+  ros__parameters:
+    mode: sim              # sim | pool | laptop | desk
+    smooth_yaw:    false   # true → yaw_ramp (smootherstep setpoint sweep)
+    smooth_linear: false   # true → linear_ramp (trapezoid thrust envelope)
