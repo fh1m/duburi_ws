@@ -24,7 +24,7 @@
 |-----------------------|--------------------------------------------------------------|
 | Hull                  | Octagonal, **Marine 5083 aluminum**, in-house                |
 | Frame type (ArduSub)  | `vectored_6dof` (8× T200) — same as BlueROV2 Heavy           |
-| Flight controller     | Pixhawk 2.4.8 running ArduSub 4.x                            |
+| Flight controller     | Pixhawk 2.4.8 running ArduSub 4.x — **or** the SROT board running Hengla, selected by the `flight_controller` ROS param. See [`.claude/context/flight-controller-hal.md`](.claude/context/flight-controller-hal.md). Default is still `pixhawk`; nothing has flown on SROT |
 | Companion             | Raspberry Pi running BlueOS                                  |
 | Main SBC              | Nvidia Jetson Orin Nano (all ROS2 nodes live here)           |
 | Depth sensor          | Bar30 (read via ArduSub `AHRS2.altitude`)                    |

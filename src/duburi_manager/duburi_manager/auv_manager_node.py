@@ -41,8 +41,11 @@ from duburi_interfaces.action import Move                                # noqa:
 from duburi_interfaces.msg import DuburiState                            # noqa: E402
 
 from duburi_control import (                                            # noqa: E402
-    COMMANDS, Duburi, Heartbeat, Pixhawk, fields_for, tracing,
+    COMMANDS, Duburi, Heartbeat, fields_for, tracing,
 )
+# Pixhawk is no longer constructed here -- make_fc() owns that, so the node
+# never names a concrete backend.
+from duburi_control.fc import make_fc                                    # noqa: E402
 from duburi_sensors import make_yaw_source                               # noqa: E402
 from duburi_vision  import wait_vision_state_ready                       # noqa: E402
 
@@ -73,6 +76,17 @@ MESSAGE_RATES = {
     mavutil.mavlink.MAVLINK_MSG_ID_AHRS2:          50,   # Hz -- yaw/depth source
     mavutil.mavlink.MAVLINK_MSG_ID_BATTERY_STATUS:  1,
     mavutil.mavlink.MAVLINK_MSG_ID_RC_CHANNELS:     5,
+}
+
+# SROT publishes a different set. It has no AHRS2 (attitude comes from
+# ATTITUDE) and no RC input at all (no radio on the vehicle), so asking for
+# RC_CHANNELS would just be ignored. ESC_STATUS is new -- real per-thruster
+# RPM, which the Pixhawk path never had.
+SROT_MESSAGE_RATES = {
+    mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE:       50,   # Hz -- yaw source
+    mavutil.mavlink.MAVLINK_MSG_ID_VFR_HUD:         5,   # depth
+    mavutil.mavlink.MAVLINK_MSG_ID_BATTERY_STATUS:  1,
+    mavutil.mavlink.MAVLINK_MSG_ID_ESC_STATUS:      5,   # per-thruster RPM
 }
 
 
@@ -135,6 +149,12 @@ class AUVManagerNode(Node):
         #   -p mav_device:=udpin:0.0.0.0:14560
         # Empty string (default) means use the resolved profile.
         self.declare_parameter('mav_device',       '')
+        # Which autopilot is on the other end. 'pixhawk' (ArduSub, the
+        # default until SROT is pool-proven) or 'srot' (the SROT board
+        # running Hengla). Both speak MAVLink 2 but with different verbs --
+        # see duburi_control/fc/ and the migration plan in the
+        # srot-control-board repo's DUBURI_WS_INTEGRATION.md.
+        self.declare_parameter('flight_controller', 'pixhawk')
         self.declare_parameter('smooth_yaw',       False)
         self.declare_parameter('smooth_translate', False)
         self.declare_parameter('yaw_source',       'mavlink_ahrs')
@@ -158,6 +178,7 @@ class AUVManagerNode(Node):
         bno085_port      = str(self.get_parameter('bno085_port').value)
         bno085_baud      = int(self.get_parameter('bno085_baud').value)
         debug_enabled    = bool(self.get_parameter('debug').value)
+        fc_kind          = str(self.get_parameter('flight_controller').value).strip()
 
         # Wire MAVLink tracing on as early as possible -- we want every
         # frame from this point on to carry the cmd= tag. set_enabled
@@ -185,11 +206,27 @@ class AUVManagerNode(Node):
         baud_kw = {'baud': profile['baud']} if profile['baud'] else {}
         self.master = mavutil.mavlink_connection(profile['conn'], **baud_kw)
         self.master.wait_heartbeat()
-        self.pixhawk = Pixhawk(self.master, log=self.get_logger())
 
-        # Pin telemetry rates so ArduSub streams what we need at the
+        # ---- Flight-controller HAL -------------------------------------
+        # `self.pixhawk` keeps its name: it is passed duck-typed into every
+        # motion_*.py function and into the yaw-source factory, and both
+        # backends expose the same surface. Renaming it would touch a dozen
+        # modules to no benefit -- the seam is the object, not the label.
+        self.fc_kind = fc_kind
+        self.pixhawk = make_fc(fc_kind, master=self.master,
+                               log=self.get_logger())
+        self.get_logger().info(f'Flight controller: {self.pixhawk.name}')
+        if not self.pixhawk.supports_rc_override:
+            self.get_logger().warning(
+                'This backend emulates RC override via MANUAL_CONTROL: a '
+                'released channel (65535) is held at NEUTRAL, not handed to '
+                'the autopilot. Depth handoff and Ch4 release do not mean '
+                'what they mean on ArduSub -- use a mode change or a move.')
+
+        # Pin telemetry rates so the vehicle streams what we need at the
         # rates we need. Done here -- the reader thread starts next.
-        for msg_id, hz in MESSAGE_RATES.items():
+        rates = SROT_MESSAGE_RATES if fc_kind.lower() == 'srot' else MESSAGE_RATES
+        for msg_id, hz in rates.items():
             self.pixhawk.set_message_rate(msg_id, hz)
 
         # ---- Reader thread (must start BEFORE yaw_source init) --------
