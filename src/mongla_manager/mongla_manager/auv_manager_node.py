@@ -113,6 +113,12 @@ MESSAGE_RATES = {
 # floor so a companion cannot starve the PARAM_VALUE / COMMAND_ACK traffic missions
 # depend on, and it refuses a request to disable HEARTBEAT.
 SROT_MESSAGE_RATES = {
+    # The board's MODE and ARMED state reach us only on HEARTBEAT, 1 Hz by
+    # default. At 1 Hz a failsafe SURFACE is invisible for up to a second --
+    # long enough for the next mission leg's SROT_MOVE to put the board back in
+    # AUTO. 10 Hz costs ~170 B/s (~1.5 % of the 115200 link) and lets
+    # `SrotFC.move` refuse that leg and see a cut-short move for what it is.
+    mavutil.mavlink.MAVLINK_MSG_ID_HEARTBEAT:      10,   # Hz -- mode/armed freshness
     mavutil.mavlink.MAVLINK_MSG_ID_ATTITUDE:       50,   # Hz -- the host-loop ceiling
     # RAW GYRO for flow de-rotation, and it was ABSENT from this table, so it
     # ran at the board's 10 Hz default while the camera ran at 30+. Measured on
@@ -235,6 +241,66 @@ class FeedbackPump:
                 print(f'[FBK  ] feedback pump fault #{fails} (verb continues): '
                       f'{traceback.format_exc(limit=1).strip()}', file=sys.stderr)
           self._stop.wait(timeout=0.4)
+
+
+# 2 Hz against the board's 5 s GCS failsafe (sp.GCS_FAILSAFE_MS): ten beats per
+# window, so a scheduler hiccup or a slow write still leaves real margin.
+HEARTBEAT_PERIOD_S = 0.5
+
+
+class _HeartbeatThread:
+    """The companion HEARTBEAT on its own daemon thread -- nothing may starve it.
+
+    ⛔ WHY NOT A ROS TIMER. It used to be `create_timer(0.5, heartbeat_tick)` in
+    the MutuallyExclusive `timer_group`, sharing one slot with callbacks that
+    BLOCK: `_vision_uplink_tick` -> `_vision_state_for` waits up to 10 s for a
+    first CameraInfo, and `_reapply_srot_config` -> `set_default_gain` busy-waits
+    up to 3 s. While either ran, no heartbeat left -- and the board SURFACES the
+    vehicle after 5 s of silence (CLAUDE.md safety rule 3). Worse, the timer
+    only existed once `executor.spin()` started, so every second of bring-up
+    after the port opened (preflight reads, BNO probe, vision pool, payload
+    join -- many seconds) was already silent.
+
+    So it is started the moment the MAVLink backend exists and runs on
+    `time.monotonic` (a wall-clock step cannot stall or burst it). Thread-safe
+    on the wire: both backends' `send_heartbeat` take the FC's `_tx_lock`, the
+    same lock every other writer (reader-thread replies, action threads) holds,
+    because pymavlink shares one sequence counter and one port.
+    """
+
+    def __init__(self, send, period_s=HEARTBEAT_PERIOD_S, log=None):
+        self._send = send
+        self._period = float(period_s)
+        self._log = log
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run, name='mongla-heartbeat', daemon=True)
+
+    def start(self):
+        self._thread.start()
+        return self
+
+    def stop(self, timeout=1.0):
+        self._stop.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=timeout)
+
+    def _run(self):
+        fails = 0
+        next_t = time.monotonic()
+        while not self._stop.is_set():
+            try:
+                self._send()
+                fails = 0
+            except Exception as exc:          # noqa: BLE001 -- must never die
+                fails += 1
+                if self._log is not None and fails in (1, 10):
+                    self._log.error(f'[NET  ] heartbeat send failed #{fails}: {exc!r}')
+            next_t += self._period
+            now = time.monotonic()
+            if next_t < now:                  # overran: re-anchor, never burst
+                next_t = now + self._period
+            self._stop.wait(next_t - now)
 
 
 def _kill_text(kill) -> str:
@@ -489,6 +555,10 @@ class AUVManagerNode(Node):
         self.fc = make_flight_controller(
             self._fc_kind, master=self.master, log=self.get_logger())
         self.pixhawk = self.fc
+        # HEARTBEAT FROM HERE ON, before a single slow bring-up step -- see
+        # _HeartbeatThread for why it is not a timer.
+        self._hb_thread = _HeartbeatThread(
+            self.fc.send_heartbeat, log=self.get_logger()).start()
         self.get_logger().info(f'[NET  ] flight_controller = {self.fc.name}')
         if self._is_srot:
             self.fc.allow_saturated_depth_arm = bool(
@@ -853,7 +923,7 @@ class AUVManagerNode(Node):
         self.heartbeat = Heartbeat(self.pixhawk, log=self.get_logger())
         # The Heartbeat streams NEUTRAL RC at 5 Hz (ArduSub FS_PILOT_INPUT guard).
         # On SROT that fights an on-board AUTO move, and the mandatory >=1 Hz MAVLink
-        # HEARTBEAT is already sent by heartbeat_tick (2 Hz) -> do NOT stream it.
+        # HEARTBEAT is already sent by _hb_thread (2 Hz) -> do NOT stream it.
         if not self._is_srot:
             self.heartbeat.start()
 
@@ -1001,7 +1071,8 @@ class AUVManagerNode(Node):
         self._register_health()
         self._health_last = None
         self.create_timer(1.0, self._health_tick, callback_group=self.timer_group)
-        self.create_timer(0.5,  self.heartbeat_tick,   callback_group=self.timer_group)
+        # (No heartbeat timer: it runs on `_hb_thread`, started in _setup_mavlink,
+        #  because this group also holds callbacks that block for seconds.)
         self.create_timer(0.5,  self.telemetry_tick,   callback_group=self.timer_group)
         # Fast tick: 20 Hz HUD compass + depth (AHRS2 pinned to 50 Hz).
         # Separate callback group so it can fire between telemetry ticks.
@@ -1370,9 +1441,20 @@ class AUVManagerNode(Node):
 
         Braked first: the board keeps running the active movement primitive until
         something displaces it, and SURFACE alone does not abort a move.
+
+        ⛔ THE ABORT IS LEFT SET -- SURFACE *IS* THE ABORT. `goal_callback` calls
+        `request_abort()` when surface arrives while another verb runs, and this
+        used to `_abort_event.clear()` on its very next line. The flag is the only
+        thing that stops the host loops -- `vision_align`/`vision_move` stream
+        MANUAL_CONTROL at 20-50 Hz and a queued `_fire_async` shot waits on it --
+        and clearing it within microseconds of setting it meant they usually never
+        saw it: the align kept driving and the shot still fired after the
+        operator said "surface". Nothing here waits on the flag (brake + one mode
+        change, no loop), so the clear protected nothing. The next verb clears it
+        at its own entry (`_command_scope`, `_run_srot_move`, `arm`), which is
+        where a stale abort is dealt with everywhere else.
         """
         timeout = float(kwargs.get('timeout', 60.0) or 60.0)
-        self.mongla._abort_event.clear()
         self.fc.stop_motion()                     # brake + cancel any running leg
         ok, reason = self.fc.set_mode('SURFACE')
 
@@ -1545,9 +1627,6 @@ class AUVManagerNode(Node):
         log = (self.get_logger().warn
                if worst is _health.State.DEGRADED else self.get_logger().error)
         log(f'[HLTH ] {worst.name}: {bad}')
-
-    def heartbeat_tick(self):
-        self.pixhawk.send_heartbeat()
 
     def _publish_flare_order(self) -> None:
         """Republish the board's latched flare order, if it has one.
@@ -1923,24 +2002,29 @@ class AUVManagerNode(Node):
 
     def _effective_yaw_deg(self, attitude):
         """Return ``(yaw_deg, label)`` -- the SAME yaw the control loops
-        close on. Prefers ``yaw_source.read_yaw()`` when fresh, falls
-        back to Pixhawk AHRS, degrades gracefully to ``(None, 'N/A')``.
+        close on: ``yaw_source.read_yaw()`` when a source is configured,
+        the (age-gated) board attitude only when none is, and
+        ``(None, 'N/A')`` when neither has a fresh value.
 
-        ``BNO085Source.read_yaw()`` already returns ``None`` when its
-        stream goes stale (see ``_STALE_S`` in ``bno085.py``), so a
-        yanked USB cable silently falls through to AHRS here rather
-        than holding the last stale BNO value forever.
+        ⛔ NO FALLBACK FROM A CONFIGURED SOURCE. This used to fall through to
+        ``attitude['yaw']`` whenever the source returned None -- and None is
+        how a source says STALE (``MavlinkAhrsSource._is_fresh``: 250 ms;
+        ``BNO085Source``: ``_STALE_S``). So the freshness gate was undone one
+        line later: after a USB drop /mongla/state kept publishing the last yaw
+        pymavlink ever cached, and it was not even the yaw the loops were
+        using (they got None and held). Absent is absent -- NaN downstream.
         """
         source = getattr(self, 'yaw_source', None)
         if source is not None:
             yaw = source.read_yaw()
-            if yaw is not None:
-                # Short-label for the [STATE] line. 'MAVLINK_AHRS' ->
-                # 'AHRS' keeps the line tidy; custom sources (BNO085,
-                # DVL, WITMOTION) render as-is.
-                raw_name = getattr(source, 'name', 'SRC')
-                label = 'AHRS' if raw_name == 'MAVLINK_AHRS' else raw_name
-                return float(yaw), label
+            if yaw is None:
+                return None, 'N/A'
+            # Short-label for the [STATE] line. 'MAVLINK_AHRS' ->
+            # 'AHRS' keeps the line tidy; custom sources (BNO085,
+            # DVL, WITMOTION) render as-is.
+            raw_name = getattr(source, 'name', 'SRC')
+            label = 'AHRS' if raw_name == 'MAVLINK_AHRS' else raw_name
+            return float(yaw), label
         if attitude is not None:
             # NaN IS ABSENCE HERE, and this branch used to pass it straight out.
             # `SrotFC.get_attitude` returns NaN yaw when the board reports the
@@ -2425,6 +2509,13 @@ def _emergency_stop(node) -> None:
             print(f'  {label:<22s} {fail_sym}  ({exc!r})', file=sys.stderr)
             return None
 
+    # ⛔ STEP 0: SIGNAL ABORT, BEFORE ANY HARDWARE STEP. Every host loop
+    # (`vision_align`/`vision_move` at 20-50 Hz, `style_roll`, a queued
+    # `_fire_async` shot) exits only on `_abort_event`, and this path never set
+    # it: the thrusters were braked and disarmed while an action thread kept
+    # streaming MANUAL_CONTROL and a delayed torpedo could still leave. It goes
+    # first because it cannot fail on the wire and every later step can.
+    _step('signal abort',       lambda: node.mongla.request_abort())
     _step('stop heading lock',  lambda: node.mongla._heading_lock.stop()
                                         if node.mongla._heading_lock else None)
     _step('stop heartbeat',     lambda: node.heartbeat.stop())
@@ -2489,11 +2580,13 @@ def main(args=None):
     finally:
         _emergency_stop(node)
         # Drain executor threads before destroying the node.  Without this,
-        # a timer callback (telemetry_tick / heartbeat_tick) can fire on a
+        # a timer callback (telemetry_tick / _health_tick) can fire on a
         # background thread concurrently with node.destroy_node(), causing
         # "publisher's context is invalid" when the logger tries to publish
         # to /rosout after the context is torn down.
         executor.shutdown(timeout_sec=1)
+        # Last, after the disarm above: the link must stay fed while it runs.
+        node._hb_thread.stop()
         node.destroy_node()
         if rclpy.ok():          # Ctrl-C unwinds spin() which may already have shut down
             rclpy.shutdown()
